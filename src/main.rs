@@ -70,6 +70,9 @@ struct AppState {
     /// 読み込んだファイルBの解析結果。
     b: Option<Analysis>,
 
+    /// 適用中のフォント（表示用）。
+    font_status: String,
+
     /// STFTのFFTサイズ（大きいほど周波数分解能↑、計算量↑）。
     n_fft: usize,
     /// STFTのホップ長（小さいほど時間方向の平均回数↑、計算量↑）。
@@ -88,6 +91,7 @@ impl Default for AppState {
         Self {
             a: None,
             b: None,
+            font_status: "Font: default".to_string(),
             n_fft: 16384,
             hop: 4096,
             target_sr: 48000,
@@ -106,7 +110,20 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Audio Spectrum Analyzer (2 files)",
         native,
-        Box::new(|_cc| Ok(Box::new(AppState::default()))),
+        Box::new(|cc| {
+            let mut app = AppState::default();
+
+            // 以前選択したフォントがあれば、それをデフォルトとして起動時に適用する。
+            // ない場合は、実行ファイル横/カレントディレクトリに `default_font.(ttf|otf)` があればそれを使う。
+            if let Some(font_path) = load_default_font_path().or_else(find_default_font_candidate) {
+                match apply_font_from_file(&cc.egui_ctx, &font_path) {
+                    Ok(()) => app.font_status = format!("Font: {} (default)", font_path.display()),
+                    Err(e) => app.status = format!("Font load failed: {e:#}"),
+                }
+            }
+
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -141,6 +158,29 @@ impl eframe::App for AppState {
                         }
                     }
                 }
+
+                ui.separator();
+
+                // フォント（日本語表示などのために、.ttf/.otf を読み込んで egui に適用）
+                if ui.button("Load Font").clicked() {
+                    if let Some(p) = pick_font_file() {
+                        match apply_font_from_file(ctx, &p) {
+                            Ok(()) => {
+                                if let Err(e) = save_default_font_path(&p) {
+                                    self.status = format!("Font applied, but save failed: {e:#}");
+                                }
+                                self.font_status = format!("Font: {} (default)", p.display());
+                            }
+                            Err(e) => self.status = format!("Error font: {e:#}"),
+                        }
+                    }
+                }
+                if ui.button("Reset Font").clicked() {
+                    reset_font(ctx);
+                    let _ = clear_default_font_path();
+                    self.font_status = "Font: default".to_string();
+                }
+                ui.label(&self.font_status);
 
                 ui.separator();
 
@@ -240,6 +280,107 @@ fn pick_audio_file() -> Option<PathBuf> {
     FileDialog::new()
         .add_filter("Audio", &["flac", "mp3", "m4a", "aac", "wav", "ogg", "opus", "webm"])
         .pick_file()
+}
+
+fn pick_font_file() -> Option<PathBuf> {
+    FileDialog::new().add_filter("Font", &["ttf", "otf"]).pick_file()
+}
+
+fn font_config_path() -> Option<PathBuf> {
+    // 実行ファイルの隣に、選択したフォントパスを保存する（次回起動時のデフォルト用）。
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("audio_analyzer.font_path.txt")))
+}
+
+fn save_default_font_path(path: &Path) -> Result<()> {
+    let Some(cfg) = font_config_path() else {
+        return Err(anyhow!("cannot determine config path"));
+    };
+    std::fs::write(cfg, path.to_string_lossy().trim()).context("write font config")?;
+    Ok(())
+}
+
+fn load_default_font_path() -> Option<PathBuf> {
+    let cfg = font_config_path()?;
+    let text = std::fs::read_to_string(cfg).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn clear_default_font_path() -> Result<()> {
+    let Some(cfg) = font_config_path() else {
+        return Ok(());
+    };
+    match std::fs::remove_file(cfg) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("remove font config")?,
+    }
+}
+
+fn find_default_font_candidate() -> Option<PathBuf> {
+    // 設定ファイルが無い/空のときのフォールバック。
+    // ここにフォントファイルを置けば、最初から日本語フォントを適用できる。
+    let candidates = [
+        "./meiryo.ttc"
+    ];
+
+    let mut bases = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            bases.push(dir.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd);
+    }
+
+    for base in bases {
+        for rel in candidates {
+            let p = base.join(rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_font_from_file(ctx: &egui::Context, path: &Path) -> Result<()> {
+    // eguiはシステムフォントを自動では使わないため、必要なフォント（例: NotoSansJP等）を
+    // ファイルから読み込んで `FontDefinitions` に登録する。
+    let data = std::fs::read(path).with_context(|| format!("read font {}", path.display()))?;
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("user_font".to_string(), egui::FontData::from_owned(data).into());
+
+    // Proportional/Monospace どちらも最優先で user_font を使う。
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "user_font".to_string());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "user_font".to_string());
+
+    ctx.set_fonts(fonts);
+    ctx.request_repaint();
+    Ok(())
+}
+
+fn reset_font(ctx: &egui::Context) {
+    ctx.set_fonts(egui::FontDefinitions::default());
+    ctx.request_repaint();
 }
 
 fn show_file_info(ui: &mut egui::Ui, info: &FileInfo) {
