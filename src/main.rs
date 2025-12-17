@@ -9,11 +9,11 @@
 //! - MP3などはデコード1回ごとのフレーム数が一定でないことがあるため、リサンプル前に
 //!   内部バッファへ貯めて固定長(1024)単位で `FftFixedIn` に渡している。
 //! - ここでは表示・比較用途のため、振幅は「最大を0dBに正規化した相対dB」。
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use rfd::FileDialog;
-use rustfft::{num_complex::Complex32, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex32};
 use std::path::{Path, PathBuf};
 use symphonia::core::{
     audio::{AudioBuffer, AudioBufferRef, Signal},
@@ -64,6 +64,11 @@ struct Analysis {
     plot_xy: Vec<[f64; 2]>,
 }
 
+enum FileSlot {
+    A,
+    B,
+}
+
 struct AppState {
     /// 読み込んだファイルAの解析結果。
     a: Option<Analysis>,
@@ -101,63 +106,76 @@ impl Default for AppState {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    // ネイティブウィンドウ設定（サイズなど）。
-    let mut native = eframe::NativeOptions::default();
-    native.viewport = native.viewport.with_inner_size([1100.0, 700.0]);
+impl AppState {
+    fn load_file_button(&mut self, ui: &mut egui::Ui, slot: FileSlot) {
+        let label = match slot {
+            FileSlot::A => "A",
+            FileSlot::B => "B",
+        };
 
-    // `eframe 0.33` では、App生成クロージャが `Result<Box<dyn App>, _>` を返す。
-    eframe::run_native(
-        "Audio Spectrum Analyzer (2 files)",
-        native,
-        Box::new(|cc| {
-            let mut app = AppState::default();
-
-            // 以前選択したフォントがあれば、それをデフォルトとして起動時に適用する。
-            // ない場合は、実行ファイル横/カレントディレクトリに `default_font.(ttf|otf)` があればそれを使う。
-            if let Some(font_path) = load_default_font_path().or_else(find_default_font_candidate) {
-                match apply_font_from_file(&cc.egui_ctx, &font_path) {
-                    Ok(()) => app.font_status = format!("Font: {} (default)", font_path.display()),
-                    Err(e) => app.status = format!("Font load failed: {e:#}"),
+        if ui.button(format!("Load {label}")).clicked() {
+            // ファイルを選び、読み込み→デコード→解析を実行して target に格納。
+            if let Some(p) = pick_audio_file() {
+                self.status = format!("Analyzing {label}: {}", p.display());
+                match analyze_file(
+                    &p,
+                    self.target_sr,
+                    self.analyze_seconds,
+                    self.n_fft,
+                    self.hop,
+                ) {
+                    Ok(ana) => {
+                        match slot {
+                            FileSlot::A => self.a = Some(ana),
+                            FileSlot::B => self.b = Some(ana),
+                        }
+                        self.status = format!("{label} loaded");
+                    }
+                    Err(e) => self.status = format!("Error {label}: {e:#}"),
                 }
             }
+        }
+    }
 
-            Ok(Box::new(app))
-        }),
-    )
-}
+    fn reanalyze_loaded(&mut self) {
+        // 現在ロード済みのパスを保持して、同じファイルを新パラメータで再解析。
+        let a_path = self.a.as_ref().map(|x| x.info.path.clone());
+        let b_path = self.b.as_ref().map(|x| x.info.path.clone());
+        self.a = None;
+        self.b = None;
 
-impl eframe::App for AppState {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 上部: 操作パネル（ロード、パラメータ、ステータス）
+        if let Some(s) = a_path {
+            let p = PathBuf::from(s);
+            self.status = format!("Re-analyzing A: {}", p.display());
+            self.a = analyze_file(
+                &p,
+                self.target_sr,
+                self.analyze_seconds,
+                self.n_fft,
+                self.hop,
+            )
+            .ok();
+        }
+        if let Some(s) = b_path {
+            let p = PathBuf::from(s);
+            self.status = format!("Re-analyzing B: {}", p.display());
+            self.b = analyze_file(
+                &p,
+                self.target_sr,
+                self.analyze_seconds,
+                self.n_fft,
+                self.hop,
+            )
+            .ok();
+        }
+        self.status = "Re-analyze done".to_string();
+    }
+
+    fn render_top_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Load A").clicked() {
-                    // ファイルを選び、読み込み→デコード→解析を実行してAに格納。
-                    if let Some(p) = pick_audio_file() {
-                        self.status = format!("Analyzing A: {}", p.display());
-                        match analyze_file(&p, self.target_sr, self.analyze_seconds, self.n_fft, self.hop) {
-                            Ok(ana) => {
-                                self.a = Some(ana);
-                                self.status = "A loaded".to_string();
-                            }
-                            Err(e) => self.status = format!("Error A: {e:#}"),
-                        }
-                    }
-                }
-                if ui.button("Load B").clicked() {
-                    // ファイルを選び、読み込み→デコード→解析を実行してBに格納。
-                    if let Some(p) = pick_audio_file() {
-                        self.status = format!("Analyzing B: {}", p.display());
-                        match analyze_file(&p, self.target_sr, self.analyze_seconds, self.n_fft, self.hop) {
-                            Ok(ana) => {
-                                self.b = Some(ana);
-                                self.status = "B loaded".to_string();
-                            }
-                            Err(e) => self.status = format!("Error B: {e:#}"),
-                        }
-                    }
-                }
+                self.load_file_button(ui, FileSlot::A);
+                self.load_file_button(ui, FileSlot::B);
 
                 ui.separator();
 
@@ -186,67 +204,72 @@ impl eframe::App for AppState {
 
                 // 解析パラメータ（ロード済みでも変更できるが、反映には Re-analyze が必要）
                 ui.label("FFT");
-                ui.add(egui::DragValue::new(&mut self.n_fft).range(1024..=131072).speed(1024.0));
+                ui.add(
+                    egui::DragValue::new(&mut self.n_fft)
+                        .range(1024..=131072)
+                        .speed(1024.0),
+                );
 
                 ui.label("Hop");
-                ui.add(egui::DragValue::new(&mut self.hop).range(256..=65536).speed(256.0));
+                ui.add(
+                    egui::DragValue::new(&mut self.hop)
+                        .range(256..=65536)
+                        .speed(256.0),
+                );
 
                 ui.label("Target SR");
-                ui.add(egui::DragValue::new(&mut self.target_sr).range(8000..=192000).speed(1000.0));
+                ui.add(
+                    egui::DragValue::new(&mut self.target_sr)
+                        .range(8000..=192000)
+                        .speed(1000.0),
+                );
 
                 ui.label("Analyze sec");
-                ui.add(egui::DragValue::new(&mut self.analyze_seconds).range(5.0..=600.0).speed(5.0));
+                ui.add(
+                    egui::DragValue::new(&mut self.analyze_seconds)
+                        .range(5.0..=600.0)
+                        .speed(5.0),
+                );
 
                 if ui.button("Re-analyze").clicked() {
-                    // 現在ロード済みのパスを保持して、同じファイルを新パラメータで再解析。
-                    let a_path = self.a.as_ref().map(|x| x.info.path.clone());
-                    let b_path = self.b.as_ref().map(|x| x.info.path.clone());
-                    self.a = None;
-                    self.b = None;
-
-                    if let Some(s) = a_path {
-                        let p = PathBuf::from(s);
-                        self.status = format!("Re-analyzing A: {}", p.display());
-                        self.a = analyze_file(&p, self.target_sr, self.analyze_seconds, self.n_fft, self.hop).ok();
-                    }
-                    if let Some(s) = b_path {
-                        let p = PathBuf::from(s);
-                        self.status = format!("Re-analyzing B: {}", p.display());
-                        self.b = analyze_file(&p, self.target_sr, self.analyze_seconds, self.n_fft, self.hop).ok();
-                    }
-                    self.status = "Re-analyze done".to_string();
+                    self.reanalyze_loaded();
                 }
 
                 ui.separator();
                 ui.label(&self.status);
             });
         });
+    }
 
-        // 左: ファイル情報とピーク一覧（A/B）
-        egui::SidePanel::left("left").resizable(true).min_width(330.0).show(ctx, |ui| {
-            ui.heading("File A");
-            if let Some(a) = &self.a {
-                show_file_info(ui, &a.info);
+    fn render_side_panel(&self, ctx: &egui::Context) {
+        egui::SidePanel::left("left")
+            .resizable(true)
+            .min_width(330.0)
+            .show(ctx, |ui| {
+                ui.heading("File A");
+                if let Some(a) = &self.a {
+                    show_file_info(ui, &a.info);
+                    ui.separator();
+                    ui.label("Top peaks (Hz, dB)");
+                    show_peaks(ui, &a.peaks);
+                } else {
+                    ui.label("Not loaded");
+                }
+
                 ui.separator();
-                ui.label("Top peaks (Hz, dB)");
-                show_peaks(ui, &a.peaks);
-            } else {
-                ui.label("Not loaded");
-            }
+                ui.heading("File B");
+                if let Some(b) = &self.b {
+                    show_file_info(ui, &b.info);
+                    ui.separator();
+                    ui.label("Top peaks (Hz, dB)");
+                    show_peaks(ui, &b.peaks);
+                } else {
+                    ui.label("Not loaded");
+                }
+            });
+    }
 
-            ui.separator();
-            ui.heading("File B");
-            if let Some(b) = &self.b {
-                show_file_info(ui, &b.info);
-                ui.separator();
-                ui.label("Top peaks (Hz, dB)");
-                show_peaks(ui, &b.peaks);
-            } else {
-                ui.label("Not loaded");
-            }
-        });
-
-        // 中央: 平均スペクトルの比較プロット
+    fn render_central_panel(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Mean Spectrum (STFT averaged)");
             ui.label("y: dB relative (0 = peak), x: Hz");
@@ -275,22 +298,62 @@ impl eframe::App for AppState {
     }
 }
 
+fn main() -> eframe::Result<()> {
+    // ネイティブウィンドウ設定（サイズなど）。
+    let mut native = eframe::NativeOptions::default();
+    native.viewport = native.viewport.with_inner_size([1100.0, 700.0]);
+
+    // `eframe 0.33` では、App生成クロージャが `Result<Box<dyn App>, _>` を返す。
+    eframe::run_native(
+        "Audio Spectrum Analyzer (2 files)",
+        native,
+        Box::new(|cc| {
+            let mut app = AppState::default();
+
+            // 以前選択したフォントがあれば、それをデフォルトとして起動時に適用する。
+            // ない場合は、実行ファイル横/カレントディレクトリに `default_font.(ttf|otf)` があればそれを使う。
+            if let Some(font_path) = load_default_font_path().or_else(find_default_font_candidate) {
+                match apply_font_from_file(&cc.egui_ctx, &font_path) {
+                    Ok(()) => app.font_status = format!("Font: {} (default)", font_path.display()),
+                    Err(e) => app.status = format!("Font load failed: {e:#}"),
+                }
+            }
+
+            Ok(Box::new(app))
+        }),
+    )
+}
+
+impl eframe::App for AppState {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_top_panel(ctx);
+        self.render_side_panel(ctx);
+        self.render_central_panel(ctx);
+    }
+}
+
 fn pick_audio_file() -> Option<PathBuf> {
     // OS標準のファイルピッカー。
     FileDialog::new()
-        .add_filter("Audio", &["flac", "mp3", "m4a", "aac", "wav", "ogg", "opus", "webm"])
+        .add_filter(
+            "Audio",
+            &["flac", "mp3", "m4a", "aac", "wav", "ogg", "opus", "webm"],
+        )
         .pick_file()
 }
 
 fn pick_font_file() -> Option<PathBuf> {
-    FileDialog::new().add_filter("Font", &["ttf", "otf"]).pick_file()
+    FileDialog::new()
+        .add_filter("Font", &["ttf", "otf"])
+        .pick_file()
 }
 
 fn font_config_path() -> Option<PathBuf> {
     // 実行ファイルの隣に、選択したフォントパスを保存する（次回起動時のデフォルト用）。
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("audio_analyzer.font_path.txt")))
+    std::env::current_exe().ok().and_then(|p| {
+        p.parent()
+            .map(|dir| dir.join("audio_analyzer.font_path.txt"))
+    })
 }
 
 fn save_default_font_path(path: &Path) -> Result<()> {
@@ -325,9 +388,7 @@ fn clear_default_font_path() -> Result<()> {
 fn find_default_font_candidate() -> Option<PathBuf> {
     // 設定ファイルが無い/空のときのフォールバック。
     // ここにフォントファイルを置けば、最初から日本語フォントを適用できる。
-    let candidates = [
-        "./meiryo.ttc"
-    ];
+    let candidates = ["./meiryo.ttc"];
 
     let mut bases = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -357,9 +418,10 @@ fn apply_font_from_file(ctx: &egui::Context, path: &Path) -> Result<()> {
     let data = std::fs::read(path).with_context(|| format!("read font {}", path.display()))?;
 
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("user_font".to_string(), egui::FontData::from_owned(data).into());
+    fonts.font_data.insert(
+        "user_font".to_string(),
+        egui::FontData::from_owned(data).into(),
+    );
 
     // Proportional/Monospace どちらも最優先で user_font を使う。
     fonts
@@ -408,14 +470,22 @@ fn show_file_info(ui: &mut egui::Ui, info: &FileInfo) {
 
 fn show_peaks(ui: &mut egui::Ui, peaks: &[(f32, f32)]) {
     // スクロール可能な簡易表。
-    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-        for (hz, db) in peaks.iter().take(12) {
-            ui.monospace(format!("{:8.1} Hz   {:6.1} dB", hz, db));
-        }
-    });
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .show(ui, |ui| {
+            for (hz, db) in peaks.iter().take(12) {
+                ui.monospace(format!("{:8.1} Hz   {:6.1} dB", hz, db));
+            }
+        });
 }
 
-fn analyze_file(path: &Path, target_sr: u32, seconds: f64, n_fft: usize, hop: usize) -> Result<Analysis> {
+fn analyze_file(
+    path: &Path,
+    target_sr: u32,
+    seconds: f64,
+    n_fft: usize,
+    hop: usize,
+) -> Result<Analysis> {
     // 1) デコードして f32 モノラルへ（必要なら target_sr にリサンプル）
     let (info, mono_f32) = decode_to_mono_f32(path, target_sr, seconds)?;
     // 2) STFT平均スペクトルを相対dBで算出
@@ -449,7 +519,11 @@ fn decode_to_mono_f32(path: &Path, target_sr: u32, seconds: f64) -> Result<(File
     // - 解析量を制限するため `seconds` 分相当のサンプル数で打ち切る
     // - サンプルレートが異なる音源同士も比較できるよう `target_sr` へ統一する
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let size_mb = file.metadata().ok().map(|m| m.len() as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
+    let size_mb = file
+        .metadata()
+        .ok()
+        .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+        .unwrap_or(0.0);
 
     // Symphoniaは `MediaSourceStream` を介して読み込む。
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -488,15 +562,13 @@ fn decode_to_mono_f32(path: &Path, target_sr: u32, seconds: f64) -> Result<(File
     // 取れないときは後で `decoded.spec().rate` から推定する。
     let sample_rate_from_params = track.codec_params.sample_rate;
     let mut input_sr = sample_rate_from_params.unwrap_or(target_sr);
-    let _channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(2);
+    let _channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
 
     // duration
     // time_base と n_frames が揃っていれば、全体の秒数を計算できる。
-    let duration_s = if let (Some(n_frames), Some(tb)) = (track.codec_params.n_frames, track.codec_params.time_base) {
+    let duration_s = if let (Some(n_frames), Some(tb)) =
+        (track.codec_params.n_frames, track.codec_params.time_base)
+    {
         tb.calc_time(n_frames).seconds as f64 + tb.calc_time(n_frames).frac as f64
     } else {
         0.0
@@ -522,11 +594,20 @@ fn decode_to_mono_f32(path: &Path, target_sr: u32, seconds: f64) -> Result<(File
     // MP3 はデコード毎のフレーム数が 1024/1152 など一定にならないことがあるため、
     // 後段で「pending に貯めて固定長で取り出す」処理を行う。
     let mut resampler: Option<FftFixedIn<f32>> = if input_sr != target_sr {
-        Some(FftFixedIn::<f32>::new(input_sr as usize, target_sr as usize, 1024, 2, 1)?)
+        Some(FftFixedIn::<f32>::new(
+            input_sr as usize,
+            target_sr as usize,
+            1024,
+            2,
+            1,
+        )?)
     } else {
         None
     };
-    let mut resample_chunk_in = resampler.as_ref().map(|r| r.input_frames_next()).unwrap_or(0);
+    let mut resample_chunk_in = resampler
+        .as_ref()
+        .map(|r| r.input_frames_next())
+        .unwrap_or(0);
     if resampler.is_some() && resample_chunk_in == 0 {
         return Err(anyhow!("resampler input chunk size is 0"));
     }
@@ -564,11 +645,20 @@ fn decode_to_mono_f32(path: &Path, target_sr: u32, seconds: f64) -> Result<(File
             if detected_sr != input_sr {
                 input_sr = detected_sr;
                 resampler = if input_sr != target_sr {
-                    Some(FftFixedIn::<f32>::new(input_sr as usize, target_sr as usize, 1024, 2, 1)?)
+                    Some(FftFixedIn::<f32>::new(
+                        input_sr as usize,
+                        target_sr as usize,
+                        1024,
+                        2,
+                        1,
+                    )?)
                 } else {
                     None
                 };
-                resample_chunk_in = resampler.as_ref().map(|r| r.input_frames_next()).unwrap_or(0);
+                resample_chunk_in = resampler
+                    .as_ref()
+                    .map(|r| r.input_frames_next())
+                    .unwrap_or(0);
                 if resampler.is_some() && resample_chunk_in == 0 {
                     return Err(anyhow!("resampler input chunk size is 0"));
                 }
@@ -585,7 +675,9 @@ fn decode_to_mono_f32(path: &Path, target_sr: u32, seconds: f64) -> Result<(File
             pending.extend_from_slice(&mono_block);
 
             // pending が十分に溜まっている間、固定長で切り出してリサンプルする。
-            while pending.len().saturating_sub(pending_offset) >= resample_chunk_in && out.len() < max_samples {
+            while pending.len().saturating_sub(pending_offset) >= resample_chunk_in
+                && out.len() < max_samples
+            {
                 let in_slice = &pending[pending_offset..(pending_offset + resample_chunk_in)];
                 let out_blocks = r.process(&[in_slice], None)?;
                 if let Some(ch0) = out_blocks.first() {
